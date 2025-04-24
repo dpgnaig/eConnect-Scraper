@@ -96,40 +96,143 @@ class Program
                     log.Info($"Successfully saved table from page {i} with {pageRecords.Count} records");
 
                     // Move to next page if not on the last page
+                    // Move to next page if not on the last page
                     if (i < totalPages)
                     {
                         string nextPage = (i + 1).ToString();
 
                         try
                         {
-                            var nextPageLink = driver.FindElement(By.XPath($"//a[contains(@href, '__doPostBack') and text()='{nextPage}']"));
+                            log.Info($"Attempting to navigate to page {nextPage}...");
 
-                            // Scroll to make sure the element is in view
-                            ((IJavaScriptExecutor)driver).ExecuteScript("arguments[0].scrollIntoView(true);", nextPageLink);
-                            Thread.Sleep(500);
-
-                            nextPageLink.Click();
-
-                            // Wait for page to load by checking for a changing element
-                            wait.Until(d => {
+                            // First try to find the page link
+                            IWebElement nextPageLink = null;
+                            try
+                            {
+                                nextPageLink = driver.FindElement(By.XPath($"//a[contains(@href, '__doPostBack') and text()='{nextPage}']"));
+                            }
+                            catch (NoSuchElementException)
+                            {
+                                log.Warn($"Next page link with text '{nextPage}' not found. Trying alternative selectors...");
+                                // Try alternative selectors to find the next page button
                                 try
                                 {
-                                    string currentPageIndicator = d.FindElement(By.CssSelector(".dgPager span")).Text;
-                                    return currentPageIndicator == nextPage;
+                                    nextPageLink = driver.FindElement(By.XPath($"//a[contains(@href, '__doPostBack') and contains(text(), '{nextPage}')]"));
                                 }
-                                catch
+                                catch (NoSuchElementException)
                                 {
-                                    return false;
+                                    // One more attempt with a more general selector
+                                    try
+                                    {
+                                        nextPageLink = driver.FindElement(By.XPath("//a[contains(@href, '__doPostBack') and contains(@class, 'dgNext')]"));
+                                        log.Info("Found 'Next' button instead of specific page number");
+                                    }
+                                    catch (NoSuchElementException ex)
+                                    {
+                                        log.Error("All attempts to find next page link failed", ex);
+                                        throw;
+                                    }
                                 }
-                            });
+                            }
 
-                            Thread.Sleep(2000); // Additional wait to ensure complete loading
+                            if (nextPageLink != null)
+                            {
+                                // Scroll to make sure the element is in view
+                                ((IJavaScriptExecutor)driver).ExecuteScript("arguments[0].scrollIntoView(true);", nextPageLink);
+                                Thread.Sleep(1000);  // Increased wait time
 
-                            log.Info($"Moved to page {nextPage}.");
+                                // Take a screenshot before clicking for debugging purposes
+                                Screenshot screenshotBefore = ((ITakesScreenshot)driver).GetScreenshot();
+                                screenshotBefore.SaveAsFile($"page{i}_before_click.png");
+                                log.Info($"Saved screenshot before clicking to page{i}_before_click.png");
+
+                                // Click with JavaScript as a more reliable method
+                                log.Info("Clicking next page link using JavaScript");
+                                ((IJavaScriptExecutor)driver).ExecuteScript("arguments[0].click();", nextPageLink);
+
+                                // Wait for AJAX/page load to complete
+                                log.Info("Waiting for page load to complete...");
+
+                                // First, wait for document ready state
+                                new WebDriverWait(driver, TimeSpan.FromSeconds(20)).Until(
+                                    d => ((IJavaScriptExecutor)d).ExecuteScript("return document.readyState").Equals("complete"));
+
+                                // Then use multiple indicators to verify page change
+                                bool pageChanged = false;
+                                int maxAttempts = 10;
+                                int attemptCount = 0;
+
+                                while (!pageChanged && attemptCount < maxAttempts)
+                                {
+                                    attemptCount++;
+                                    Thread.Sleep(1000);  // Wait between checks
+
+                                    try
+                                    {
+                                        // Method 1: Check page indicator if available
+                                        try
+                                        {
+                                            string currentPageIndicator = driver.FindElement(By.CssSelector(".dgPager span")).Text;
+                                            if (currentPageIndicator == nextPage)
+                                            {
+                                                log.Info($"Page changed confirmed via page indicator showing '{currentPageIndicator}'");
+                                                pageChanged = true;
+                                                continue;
+                                            }
+                                        }
+                                        catch (Exception) { /* Ignore and try other methods */ }
+
+                                        // Method 2: Check URL parameters if they contain page info
+                                        string currentUrl = driver.Url;
+                                        if (currentUrl.Contains($"page={nextPage}") || currentUrl.Contains($"PageIndex={nextPage}"))
+                                        {
+                                            log.Info($"Page changed confirmed via URL parameter");
+                                            pageChanged = true;
+                                            continue;
+                                        }
+
+                                        // Method 3: Check if any content has changed
+                                        string tableHtml = driver.FindElement(By.XPath("//table[@id='GridData_New']")).GetAttribute("outerHTML").GetHashCode().ToString();
+                                        if (tableHtml != currentTableHtml.GetHashCode().ToString())
+                                        {
+                                            log.Info("Page changed confirmed via table content change");
+                                            pageChanged = true;
+                                            continue;
+                                        }
+
+                                        log.Info($"Still waiting for page change confirmation (attempt {attemptCount}/{maxAttempts})");
+                                    }
+                                    catch (Exception ex)
+                                    {
+                                        log.Warn($"Error checking page change: {ex.Message}");
+                                    }
+                                }
+
+                                if (!pageChanged)
+                                {
+                                    log.Error($"Could not confirm page change to page {nextPage} after {maxAttempts} attempts");
+                                    // Take a screenshot of the current state for debugging
+                                    Screenshot screenshot = ((ITakesScreenshot)driver).GetScreenshot();
+                                    screenshot.SaveAsFile($"page_change_failed_to_{nextPage}.png");
+                                    log.Info($"Saved debug screenshot to page_change_failed_to_{nextPage}.png");
+
+                                    // Try to recover by refreshing the page
+                                    driver.Navigate().Refresh();
+                                    Thread.Sleep(5000);
+                                }
+                                else
+                                {
+                                    log.Info($"Successfully navigated to page {nextPage}");
+                                }
+                            }
                         }
                         catch (Exception ex)
                         {
-                            log.Error($"Error navigating to page {nextPage}", ex);
+                            log.Error($"Critical error navigating to page {nextPage}", ex);
+                            // Take a screenshot of the error state
+                            Screenshot screenshot = ((ITakesScreenshot)driver).GetScreenshot();
+                            screenshot.SaveAsFile($"navigation_error_page_{i}_to_{nextPage}.png");
+                            log.Error($"Navigation failed. Debug screenshot saved to navigation_error_page_{i}_to_{nextPage}.png");
                             break;
                         }
                     }
