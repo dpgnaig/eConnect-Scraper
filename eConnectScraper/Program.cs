@@ -1,15 +1,10 @@
-﻿using OpenQA.Selenium;
+﻿using log4net;
+using OpenQA.Selenium;
 using OpenQA.Selenium.Chrome;
 using OpenQA.Selenium.Support.UI;
-using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text.RegularExpressions;
-using System.IO;
-using System.Threading;
+using System.Diagnostics;
 using System.Reflection;
-using log4net;
-using log4net.Config;
+using System.Text.RegularExpressions;
 
 class Program
 {
@@ -23,8 +18,16 @@ class Program
 
         log.Info("Starting scraper...");
 
+        string downloadDirectory = Path.Combine(Directory.GetCurrentDirectory(), "downloads");
+        Directory.CreateDirectory(downloadDirectory); // Create the directory if it doesn't exist
+
         var options = new ChromeOptions();
         options.AddArguments("--headless=new", "--disable-gpu", "--window-size=1920,1080", "--blink-settings=imagesEnabled=false");
+        options.AddUserProfilePreference("download.default_directory", downloadDirectory);
+        options.AddUserProfilePreference("download.prompt_for_download", false);
+        options.AddUserProfilePreference("download.directory_upgrade", true);
+        options.AddUserProfilePreference("safebrowsing.enabled", true);
+        options.AddUserProfilePreference("plugins.always_open_pdf_externally", false); // For PDF files
 
         using var driver = new ChromeDriver(options);
         var wait = new WebDriverWait(driver, TimeSpan.FromSeconds(10));
@@ -45,6 +48,8 @@ class Program
             int totalJobs = GetTotalJobs(driver.PageSource);
             int totalPages = CalculateTotalPages(totalJobs, 100);
             log.Info($"Total jobs: {totalJobs}, Total pages: {totalPages}");
+
+            ExportSpreadsheet(driver, downloadDirectory);
 
             List<JobRecord> allRows = new List<JobRecord>();
             string outputFileName = $"Scraper_{DateTime.Now:yyyyMMdd_HHmmss}.html";
@@ -255,6 +260,141 @@ class Program
         driver.Quit();
         log.Info("Browser closed.");
     }
+
+    static void ExportSpreadsheet(IWebDriver driver, string downloadDirectory)
+    {
+        try
+        {
+            log.Info("Attempting to export spreadsheet...");
+
+            // Try to find the export link
+            IWebElement exportLink = null;
+            try
+            {
+                exportLink = driver.FindElement(By.Id("lnkExcel"));
+                log.Info("Found export link by ID");
+            }
+            catch (NoSuchElementException)
+            {
+                try
+                {
+                    exportLink = driver.FindElement(By.XPath("//a[contains(@class, 'link') and contains(text(), 'Export to Spreadsheet')]"));
+                    log.Info("Found export link by XPath");
+                }
+                catch (NoSuchElementException)
+                {
+                    log.Error("Could not find export link on the page");
+                    return;
+                }
+            }
+
+            // Take a screenshot before attempting to export
+            Screenshot screenshot = ((ITakesScreenshot)driver).GetScreenshot();
+            screenshot.SaveAsFile("before_export.png");
+            log.Info("Saved screenshot before export attempt");
+
+            // Try scrolling to the element first
+            IJavaScriptExecutor js = (IJavaScriptExecutor)driver;
+            js.ExecuteScript("arguments[0].scrollIntoView(true);", exportLink);
+            Thread.Sleep(1000);
+
+            // FIXED: Try multiple methods to trigger the export, avoiding __doPostBack
+            try
+            {
+                // Method 1: Direct click first
+                log.Info("Attempting to export using direct click");
+                exportLink.Click();
+            }
+            catch (Exception clickEx)
+            {
+                log.Warn($"Direct click failed: {clickEx.Message}. Trying JavaScript click...");
+
+                // Method 2: JavaScript click
+                log.Info("Attempting to export using JavaScript click");
+                js.ExecuteScript("arguments[0].click();", exportLink);
+            }           
+
+            log.Info("Export action triggered, waiting for download...");
+
+            // Wait for the download to complete
+            bool downloadSuccess = WaitForDownload(downloadDirectory);
+
+            if (downloadSuccess)
+            {
+                log.Info("Spreadsheet export successfully completed");
+            }
+            else
+            {
+                log.Error("Failed to detect downloaded spreadsheet file");
+            }
+        }
+        catch (Exception ex)
+        {
+            log.Error("Failed to export spreadsheet", ex);
+        }
+    }
+
+    static bool WaitForDownload(string downloadDirectory, int timeoutSeconds = 60)
+    {
+        bool isDownloadComplete = false;
+        Stopwatch stopwatch = new Stopwatch();
+        stopwatch.Start();
+        string downloadedFilePath = null;
+
+        log.Info($"Waiting for file download to complete in directory: {downloadDirectory}");
+
+        while (!isDownloadComplete && stopwatch.Elapsed.TotalSeconds < timeoutSeconds)
+        {
+            // Check if any files are being downloaded
+            string[] downloadingFiles = Directory.GetFiles(downloadDirectory, "*.crdownload");
+            string[] tempFiles = Directory.GetFiles(downloadDirectory, "*.tmp");
+
+            if (downloadingFiles.Length > 0 || tempFiles.Length > 0)
+            {
+                log.Debug("Download in progress...");
+                Thread.Sleep(1000);
+                continue;
+            }
+
+            // Check if any new files have appeared
+            string[] excelFiles = Directory.GetFiles(downloadDirectory, "*.xlsx");
+            string[] csvFiles = Directory.GetFiles(downloadDirectory, "*.csv");
+            string[] xlsFiles = Directory.GetFiles(downloadDirectory, "*.xls");
+
+            string[] allFiles = excelFiles.Concat(csvFiles).Concat(xlsFiles).ToArray();
+
+            if (allFiles.Length > 0)
+            {
+                // Get the most recent file
+                var mostRecentFile = allFiles
+                    .Select(f => new FileInfo(f))
+                    .OrderByDescending(f => f.CreationTime)
+                    .FirstOrDefault();
+
+                if (mostRecentFile != null &&
+                    (DateTime.Now - mostRecentFile.CreationTime).TotalSeconds < timeoutSeconds)
+                {
+                    downloadedFilePath = mostRecentFile.FullName;
+                    log.Info($"Download completed: {mostRecentFile.Name}");
+                    isDownloadComplete = true;
+                }
+            }
+
+            if (!isDownloadComplete)
+                Thread.Sleep(500);
+        }
+
+        if (!isDownloadComplete)
+        {
+            log.Error("File download timed out or failed");
+            return false;
+        }
+
+        log.Info($"File successfully downloaded to: {downloadedFilePath}");
+        return true;
+    }
+
+
 
     static void ConfigureLogging()
     {
